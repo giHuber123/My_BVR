@@ -7,6 +7,16 @@ import gc
 from gymnasium import spaces
 from baseline_action import FlightActions
 
+import jsbsim
+import numpy as np
+import math
+import os
+import gymnasium as gym
+import gc
+from gymnasium import spaces
+from baseline_action import FlightActions
+
+
 class AirCombatEnv(gym.Env):
     def __init__(self, model_name="f16", dt=1 / 60.0):
         super(AirCombatEnv, self).__init__()
@@ -14,85 +24,117 @@ class AirCombatEnv(gym.Env):
         self.model_name = model_name
         self.root_path = os.environ.get('JSBSIM_ROOT', 'jsbsim-master')
 
-        # 动作空间：[滚转, 俯仰, 偏航, 油门]
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
-
-        # 观测空间升级为 23 维：
-        # 1-15: 本机状态 (高度, 速度, 姿态, 攻角, 过载, 舵面)
-        # 16-23: 增强相对态势 (高度差, 速度差, 距离, 相对方向矢量XYZ, ATA正余弦)
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(23,), dtype=np.float32)
+
+        self.max_steps = 12000
+        self.gun_fire_timer = 0
+        self.kill_threshold = 60  # 1秒连续咬尾判定
 
         self.fdm_red = None
         self.fdm_blue = None
-        self.prev_action = np.zeros(4)
-        self.prev_prev_action = np.zeros(4)
-        self.steps = 0
-
-    def _create_fdm(self):
-        fdm = jsbsim.FGFDMExec(self.root_path)
-        fdm.set_debug_level(0)
-        fdm.load_model(self.model_name)
-        fdm.set_dt(self.dt)
-        return fdm
-
-    def _init_aircraft(self, fdm, lat_off, lon_off, alt, heading, speed):
-        fdm['ic/lat-gc-deg'] = 30.0 + lat_off
-        fdm['ic/long-gc-deg'] = 120.0 + lon_off
-        fdm['ic/h-sl-ft'] = alt / 0.3048
-        fdm['ic/psi-true-deg'] = heading
-        fdm['ic/vt-fps'] = speed / 0.3048
-        fdm['propulsion/set-running'] = -1
-        fdm.run_ic()
-
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        self.close()
-
-        self.fdm_red = self._create_fdm()
-        self.fdm_blue = self._create_fdm()
-
-        # 初始化：红方朝北，蓝方在北边 0.15 度处朝南对冲
-        self._init_aircraft(self.fdm_red, 0.0, 0.0, 20000.0, 0.0, 300.0)
-        self._init_aircraft(self.fdm_blue, 0.15, 0.0, 20000.0, 180.0, 300.0)
 
         self.prev_action = np.zeros(4)
         self.prev_prev_action = np.zeros(4)
+
+        self.ctrl_red = FlightActions()
         self.steps = 0
 
-        return self._get_full_obs(), {}
+    def _get_pos_neu(self, fdm):
+        """将经纬高转换为本地NEU坐标(米)"""
+        lat = fdm['position/lat-gc-deg']
+        lon = fdm['position/long-gc-deg']
+        alt = fdm['position/h-sl-ft'] * 0.3048
+        x = lat * 111132.0
+        y = lon * 111132.0 * math.cos(math.radians(lat))
+        return np.array([x, y, alt])
 
-    def step(self, action_red, action_blue):
-        self._apply_action(self.fdm_red, action_red)
+    def check_gun_wez(self, fdm_s, fdm_t):
+        """检查 WEZ 条件"""
+        pos_s = self._get_pos_neu(fdm_s)
+        pos_t = self._get_pos_neu(fdm_t)
+        rel_pos = pos_t - pos_s
+        dist = np.linalg.norm(rel_pos)
+        rel_dir = rel_pos / (dist + 1e-6)
+
+        # ATA (指向角)
+        psi, theta = fdm_s['attitude/psi-rad'], fdm_s['attitude/theta-rad']
+        head_dir = np.array([math.cos(theta) * math.cos(psi), math.cos(theta) * math.sin(psi), math.sin(theta)])
+        ata = math.acos(np.clip(np.dot(head_dir, rel_dir), -1.0, 1.0))
+
+        # AA (被咬尾角)
+        psi_t, theta_t = fdm_t['attitude/psi-rad'], fdm_t['attitude/theta-rad']
+        target_head_dir = np.array(
+            [math.cos(theta_t) * math.cos(psi_t), math.cos(theta_t) * math.sin(psi_t), math.sin(theta_t)])
+        aa = math.acos(np.clip(np.dot(target_head_dir, rel_dir), -1.0, 1.0))
+
+        in_wez = (300 < dist < 1000) and (math.degrees(ata) < 15.0) and (math.degrees(aa) < 60.0)
+        return in_wez, dist, math.degrees(ata)
+
+    def _get_full_obs(self):
+        def get_my_obs(fdm):
+            return [
+                fdm['position/h-sl-ft'] * 0.3048 / 10000.0, fdm['velocities/vt-fps'] * 0.3048 / 340.0,
+                fdm['attitude/phi-rad'] / math.pi, fdm['attitude/theta-rad'] / (math.pi / 2),
+                math.sin(fdm['attitude/psi-rad']), math.cos(fdm['attitude/psi-rad']),
+                fdm['aero/alpha-rad'] / (math.pi / 6), fdm['aero/beta-rad'] / (math.pi / 18),
+                fdm['accelerations/n-pilot-x-norm'] / 2.0, fdm['accelerations/n-pilot-y-norm'] / 5.0,
+                fdm['accelerations/n-pilot-z-norm'] / 9.0, fdm['fcs/left-aileron-pos-norm'],
+                fdm['fcs/elevator-pos-norm'], fdm['fcs/rudder-pos-norm'], fdm['fcs/throttle-pos-norm']
+            ]
+
+        pos_s, pos_t = self._get_pos_neu(self.fdm_red), self._get_pos_neu(self.fdm_blue)
+        rel_pos = pos_t - pos_s
+        dist = np.linalg.norm(rel_pos)
+        rel_dir = rel_pos / (dist + 1e-6)
+
+        d_alt = pos_t[2] - pos_s[2]
+        d_v = (self.fdm_blue['velocities/vt-fps'] - self.fdm_red['velocities/vt-fps']) * 0.3048
+
+        # 计算辅助 ATA 用语观测
+        psi, theta = self.fdm_red['attitude/psi-rad'], self.fdm_red['attitude/theta-rad']
+        head_dir = np.array([math.cos(theta) * math.cos(psi), math.cos(theta) * math.sin(psi), math.sin(theta)])
+        ata = math.acos(np.clip(np.dot(head_dir, rel_dir), -1.0, 1.0))
+
+        rel_obs = [d_alt / 1000.0, d_v / 340.0, dist / 10000.0, rel_dir[0], rel_dir[1], rel_dir[2], math.sin(ata),
+                   math.cos(ata)]
+        return np.concatenate([get_my_obs(self.fdm_red), rel_obs]).astype(np.float32)
+
+    def step(self, action_blue):
+
+        act_r = self.ctrl_red.get_action(self.fdm_red['aero/alpha-deg'],
+        self.fdm_red['attitude/phi-deg'],self.fdm_red['velocities/q-rad_sec'], self.fdm_red['velocities/p-rad_sec'], 1, 0.0)
+        action_red = np.array([act_r[1], act_r[0], 0.0, 0.8], dtype=np.float32)
         self._apply_action(self.fdm_blue, action_blue)
-
+        self._apply_action(self.fdm_red, action_red)
         self.fdm_red.run()
         self.fdm_blue.run()
         self.steps += 1
+
+        in_wez, dist, ata_deg = self.check_gun_wez(self.fdm_red, self.fdm_blue)
+        if in_wez:
+            self.gun_fire_timer += 1
+        else:
+            self.gun_fire_timer = max(0, self.gun_fire_timer - 1)
 
         obs = self._get_full_obs()
         reward = self._compute_reward(self.fdm_red, self.fdm_blue, action_red)
 
         terminated = False
-        info = {"reason": "alive"}
+        truncated = False
+        info = {"reason": "alive", "dist": dist, "ata": ata_deg}
 
-        # 终止条件：坠毁或严重失速
-        if (self.fdm_red['position/h-sl-ft'] * 0.3048) < 500.0:
-            terminated = True
-            info["reason"] = "CRASH"
-        if abs(self.fdm_red['aero/alpha-deg']) > 25.0:
-            terminated = True
-            info["reason"] = "STALL"
+        if self.gun_fire_timer >= self.kill_threshold:
+            terminated, info["reason"] = True, "KILLED_TARGET"
+            reward += 1000.0
+        elif (self.fdm_red['position/h-sl-ft'] * 0.3048) < 500.0:
+            terminated, info["reason"] = True, "CRASH"
+        elif abs(self.fdm_red['aero/alpha-deg']) > 25.0:
+            terminated, info["reason"] = True, "STALL"
+        elif self.steps >= self.max_steps:
+            truncated, info["reason"] = True, "TIMEOUT"
 
-        return obs, reward, terminated, False, info
-
-    def close(self):
-        if self.fdm_red is not None:
-            del self.fdm_red
-            self.fdm_red = None
-        if self.fdm_blue is not None:
-            del self.fdm_blue
-            self.fdm_blue = None
-        gc.collect()
+        return obs, reward, terminated, truncated, info
 
     def _apply_action(self, fdm, action):
         fdm['fcs/aileron-cmd-norm'] = action[0]
@@ -100,52 +142,37 @@ class AirCombatEnv(gym.Env):
         fdm['fcs/rudder-cmd-norm'] = action[2]
         fdm['fcs/throttle-cmd-norm'] = (action[3] + 1.0) * 0.5
 
-    def _get_full_obs(self):
-        # 1. 本机状态 (15维)
-        def get_my_obs(fdm):
-            return np.array([
-                fdm['position/h-sl-ft'] * 0.3048 / 10000.0,
-                fdm['velocities/vt-fps'] * 0.3048 / 340.0,
-                fdm['attitude/phi-rad'] / math.pi,
-                fdm['attitude/theta-rad'] / (math.pi / 2),
-                math.sin(fdm['attitude/psi-rad']),
-                math.cos(fdm['attitude/psi-rad']),
-                fdm['aero/alpha-rad'] / (math.pi / 6),
-                fdm['aero/beta-rad'] / (math.pi / 18),
-                fdm['accelerations/n-pilot-x-norm'] / 2.0,
-                fdm['accelerations/n-pilot-y-norm'] / 5.0,
-                fdm['accelerations/n-pilot-z-norm'] / 9.0,
-                fdm['fcs/left-aileron-pos-norm'],
-                fdm['fcs/elevator-pos-norm'],
-                fdm['fcs/rudder-pos-norm'],
-                fdm['fcs/throttle-pos-norm']
-            ], dtype=np.float32)
-
-        # 2. 增强相对态势 (8维)
-        def get_rel_obs(f_s, f_t):
-            pos_s = self._get_pos_neu(f_s)
-            pos_t = self._get_pos_neu(f_t)
-            rel_pos = pos_t - pos_s
-            dist = np.linalg.norm(rel_pos)
-            rel_dir = rel_pos / (dist + 1e-6)  # 包含前后、左右、高低的方向矢量
-
-            d_alt = (f_t['position/h-sl-ft'] - f_s['position/h-sl-ft']) * 0.3048
-            d_v = (f_t['velocities/vt-fps'] - f_s['velocities/vt-fps']) * 0.3048
-
-            ata = self._calculate_ata(f_s, f_t)
-
-            return np.array([
-                d_alt / 1000.0,  # 高低差
-                d_v / 340.0,  # 速度差
-                dist / 100000.0,  # 远近
-                rel_dir[0],  # 北向(前/后感)
-                rel_dir[1],  # 东向(左/右感)
-                rel_dir[2],  # 天向(高/低感)
-                math.sin(ata),  # 进攻指向感 sin
-                math.cos(ata)  # 进攻指向感 cos
-            ], dtype=np.float32)
-
-        return np.concatenate([get_my_obs(self.fdm_red), get_rel_obs(self.fdm_red, self.fdm_blue)])
+    # def check_gun_wez(self, fdm_s, fdm_t):
+    #     """
+    #     检查进攻方(fdm_s)是否在防守方(fdm_t)的机炮攻击区内
+    #     """
+    #     pos_s = np.array([fdm_s['position/lat-gc-deg'] * 111000, fdm_s['position/long-gc-deg'] * 111000,
+    #                       fdm_s['position/h-sl-ft'] * 0.3048])
+    #     pos_t = np.array([fdm_t['position/lat-gc-deg'] * 111000, fdm_t['position/long-gc-deg'] * 111000,
+    #                       fdm_t['position/h-sl-ft'] * 0.3048])
+    #
+    #     # 1. 计算距离 (单位: 米)
+    #     dist = np.linalg.norm(pos_t - pos_s)
+    #
+    #     # 2. 计算 ATA (机头指向敌机的角度)
+    #     rel_pos_vec = (pos_t - pos_s) / (dist + 1e-6)
+    #     psi, theta = fdm_s['attitude/psi-rad'], fdm_s['attitude/theta-rad']
+    #     head_dir = np.array([math.cos(theta) * math.cos(psi), math.cos(theta) * math.sin(psi), math.sin(theta)])
+    #     ata = math.acos(np.clip(np.dot(head_dir, rel_pos_vec), -1.0, 1.0))
+    #
+    #     # 3. 计算 Aspect Angle (敌机尾后相对于你的角度)
+    #     psi_t, theta_t = fdm_t['attitude/psi-rad'], fdm_t['attitude/theta-rad']
+    #     tail_dir = np.array(
+    #         [math.cos(theta_t) * math.cos(psi_t), math.cos(theta_t) * math.sin(psi_t), math.sin(theta_t)])
+    #     # 注意：AA 是敌机速度矢量与相对位置矢量的夹角
+    #     aa = math.acos(np.clip(np.dot(tail_dir, rel_pos_vec), -1.0, 1.0))
+    #
+    #     # 逻辑判断
+    #     in_range = 300 < dist < 1000
+    #     in_ata = math.degrees(ata) < 15.0  # 机炮瞄准要求极高
+    #     in_aa = math.degrees(aa) < 45.0  # 处于敌机尾后区
+    #
+    #     return in_range and in_ata and in_aa, dist, math.degrees(ata)
 
     def _get_pos_neu(self, fdm):
         return np.array([
@@ -174,8 +201,6 @@ class AirCombatEnv(gym.Env):
             math.sin(theta)
         ])
         return math.acos(np.clip(np.dot(head_dir, rel_pos_vec), -1.0, 1.0))
-
-    # --- 奖励与惩罚系统 ---
 
     def _compute_reward(self, fdm_s, fdm_t, action_s):
         return self._compute_situation_reward(fdm_s, fdm_t) + \
@@ -214,111 +239,144 @@ class AirCombatEnv(gym.Env):
 
         return -(0.1 * rate_error + 0.05 * accel_error)
 
+    def _compute_gun_wez_reward(self, fdm_s, fdm_t):
+        """
+        计算机炮攻击区(WEZ)的塑造奖励
+        fdm_s: 进攻方 (Red)
+        fdm_t: 防守方 (Blue)
+        """
+        # 1. 提取基础物理量
+        pos_s = self._get_pos_neu(fdm_s)
+        pos_t = self._get_pos_neu(fdm_t)
+        rel_pos = pos_t - pos_s
+        dist = np.linalg.norm(rel_pos)
+        rel_dir = rel_pos / (dist + 1e-6)
 
-import jsbsim
-import numpy as np
-import math
-import os
+        # 2. 计算关键角度 (ATA 和 AA)
+        # ATA: 机头指向敌机的角度 (越小越好)
+        ata = self._calculate_ata(fdm_s, fdm_t)
+
+        # AA (Aspect Angle): 敌机尾部指向你的角度 (越小代表你越在它正后方)
+        psi_t, theta_t = fdm_t['attitude/psi-rad'], fdm_t['attitude/theta-rad']
+        # 敌机机头方向向量
+        target_head_dir = np.array([
+            math.cos(theta_t) * math.cos(psi_t),
+            math.cos(theta_t) * math.sin(psi_t),
+            math.sin(theta_t)
+        ])
+        # AA 是敌机速度矢量与“敌机到我”矢量的夹角
+        # 这里我们简化为：你的位置与敌机机头方向的夹角。
+        # 如果 dot(target_head_dir, -rel_dir) 接近 1，说明你在它正后方
+        aspect_cos = np.dot(target_head_dir, rel_dir)
+        aa = math.acos(np.clip(aspect_cos, -1.0, 1.0))
+
+        # --- 开始塑造奖励 ---
+
+        # A. 指向奖励 (Angle Reward): 鼓励机头对准目标
+        # 使用 cos(ata)，当 ata=0时奖励为1，ata=90时为0，ata>90为负
+        r_ata = math.cos(ata)
+
+        # B. 距离奖励 (Distance Reward): 鼓励保持在 300-1000米
+        # 使用高斯分布，峰值在 600米，标准差 400米
+        r_dist = math.exp(-((dist - 600) ** 2) / (2 * 400 ** 2))
+
+        # C. 咬尾奖励 (Aspect Reward): 鼓励绕到对方后方
+        # 当你在对方后方时 (aspect_cos > 0)，奖励为正
+        r_aspect = aspect_cos
+
+        # D. 综合射击窗口奖励 (Gun WEZ Bonus)
+        # 只有当同时满足：距离近、角度准、在后方时，给一个巨大的乘积奖励
+        is_in_wez = (300 < dist < 1000) and (math.degrees(ata) < 15) and (math.degrees(aa) < 60)
+        r_wez_bonus = 10.0 if is_in_wez else 0.0
+
+        # 加权求和 (权重可以根据训练效果调整)
+        total_gun_reward = (0.5 * r_ata) + (0.3 * r_dist) + (0.2 * r_aspect) + r_wez_bonus
+
+        return total_gun_reward
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        if self.fdm_red: self.close()
+        self.fdm_red, self.fdm_blue = self._create_fdm(), self._create_fdm()
+        self._init_aircraft(self.fdm_red, 0.0, 0.0, 20000.0, 0.0, 300.0)
+        self._init_aircraft(self.fdm_blue, 0.15, 0.0, 20000.0, 180.0, 300.0)
+        self.steps, self.gun_fire_timer = 0, 0
+        self.prev_action = np.zeros(4)
+        self.prev_prev_action = np.zeros(4)
+        self.ctrl_red.reset()
+
+        return self._get_full_obs(), {}
+
+    def _create_fdm(self):
+        fdm = jsbsim.FGFDMExec(self.root_path)
+        fdm.set_debug_level(0)
+        fdm.load_model(self.model_name)
+        fdm.set_dt(self.dt)
+        return fdm
+
+    def _init_aircraft(self, fdm, lat_off, lon_off, alt, heading, speed):
+        fdm['ic/lat-gc-deg'], fdm['ic/long-gc-deg'] = 30.0 + lat_off, 120.0 + lon_off
+        fdm['ic/h-sl-ft'], fdm['ic/psi-true-deg'] = alt / 0.3048, heading
+        fdm['ic/vt-fps'] = speed / 0.3048
+        fdm['propulsion/set-running'] = -1
+        fdm.run_ic()
+
+    def close(self):
+        if self.fdm_red: del self.fdm_red
+        if self.fdm_blue: del self.fdm_blue
+        self.fdm_red, self.fdm_blue = None, None
+        gc.collect()
 
 
-# --- 增强版 ACMI 录制类：支持双机 ---
+# --- 录制与测试保持你原来的 ACMIDualLogger 和 test_env 逻辑即可 ---
+# --- 录制类 ---
 class ACMIDualLogger:
-    def __init__(self, filename="air_combat_test.acmi"):
+    def __init__(self, filename="air_combat_dogfight.acmi"):
         self.file = open(filename, "w", encoding="utf-8")
-        self.file.write("FileType=text/acmi/tacview\n")
-        self.file.write("FileVersion=2.1\n")
-        self.file.write("0,ReferenceTime=2024-01-01T00:00:00Z\n")
+        self.file.write("FileType=text/acmi/tacview\nFileVersion=2.1\n0,ReferenceTime=2024-01-01T00:00:00Z\n")
 
     def log_state(self, sim_time, fdm_red, fdm_blue):
         self.file.write(f"#{sim_time:.2f}\n")
-
-        # 记录红方 (ID=1)
         self._write_aircraft(1, fdm_red, "F-16_RED", "Red")
-        # 记录蓝方 (ID=2)
         self._write_aircraft(2, fdm_blue, "F-16_BLUE", "Blue")
 
     def _write_aircraft(self, obj_id, fdm, name, color):
-        lat = fdm['position/lat-geod-deg']
-        lon = fdm['position/long-gc-deg']
-        alt = fdm['position/h-sl-ft'] * 0.3048
-        roll = fdm['attitude/phi-deg']
-        pitch = fdm['attitude/theta-deg']
-        yaw = fdm['attitude/heading-true-rad']
-        yaw = np.rad2deg(yaw)
-        # T=Lon|Lat|Alt|Roll|Pitch|Yaw
-        line = f"{obj_id},T={lon}|{lat}|{alt}|{roll}|{pitch}|{yaw},Name={name},Color={color},Type=Air+FixedWing\n"
+        line = f"{obj_id},T={fdm['position/long-gc-deg']}|{fdm['position/lat-geod-deg']}|{fdm['position/h-sl-ft'] * 0.3048}|{fdm['attitude/phi-deg']}|{fdm['attitude/theta-deg']}|{np.rad2deg(fdm['attitude/psi-rad'])},Name={name},Color={color},Type=Air+FixedWing\n"
         self.file.write(line)
 
     def close(self):
         self.file.close()
 
 
-# --- 修改后的 test_env 函数 ---
+# --- 测试主函数 ---
 def test_env():
-    # 1. 初始化环境与录制器
-    env = AirCombatEnv(model_name="f16")
+    env = AirCombatEnv()
     obs, _ = env.reset()
+    logger = ACMIDualLogger()
+    ctrl_red, ctrl_blue = FlightActions(), FlightActions()
 
-    # 初始化控制器和录制器
-    controller = FlightActions()
-    controller_blue = FlightActions()
-    logger = ACMIDualLogger("air_combat_dogfight.acmi")
-
-    print(f"{'Step':<6} | {'Dist(km)':<10} | {'ATA(deg)':<8} | {'Status':<10}")
-    print("-" * 50)
-
-    # 模拟运行 1200 步 (约 20 秒，dt=1/60)
     for i in range(12000):
-        # --- 红方逻辑：使用 PID 保持攻角和滚转 ---
-        curr_alpha = env.fdm_red['aero/alpha-deg']
+        # 蓝方控制 (平飞)
+        act_b = ctrl_blue.get_action(env.fdm_blue['aero/alpha-deg'], env.fdm_blue['attitude/phi-deg'],
+                                     env.fdm_blue['velocities/q-rad_sec'], env.fdm_blue['velocities/p-rad_sec'], 0.0,
+                                     0.0)
 
-        curr_roll = env.fdm_red['attitude/phi-deg']
-        curr_q = env.fdm_red['velocities/q-rad_sec']
-        curr_p = env.fdm_red['velocities/p-rad_sec']
+        # 映射到环境：[aileron, elevator, rudder, throttle]
 
-        curr_alpha_blue = env.fdm_blue['aero/alpha-deg']
-        curr_roll_blue = env.fdm_blue['attitude/phi-deg']
-        curr_q_blue = env.fdm_blue['velocities/q-rad_sec']
-        curr_p_blue = env.fdm_blue['velocities/p-rad_sec']
-        # 获取红方 Action (维持 2.5度攻角平飞)
-        pid_action = controller.get_action(
-            current_alpha=curr_alpha,
-            current_roll=curr_roll,
-            q_rad=curr_q,
-            p_rad=curr_p,
-            target_alpha=0.1,
-            target_roll=0.0
-        )
+        step_act_b = np.array([act_b[1], -act_b[0], 0.0, 0.5], dtype=np.float32)
 
-        pid_action_blue = controller_blue.get_action(
-            current_alpha=curr_alpha_blue,
-            current_roll=curr_roll_blue,
-            q_rad=curr_q_blue,
-            p_rad=curr_p_blue,
-            target_alpha=0.0,
-            target_roll=0.0
-        )
-        # 组装 Action [aileron, elevator, rudder, throttle]
-        # 注意：env.step 期望的是红蓝双方的动作
-        action_red = np.array([pid_action[1], -pid_action[0], 0.0, 0.8], dtype=np.float32)
+        obs, reward, terminated, truncated, info = env.step(step_act_b)
 
-        # 蓝方逻辑：保持现状，油门 0.5
-        action_blue = np.array([pid_action_blue[1], -pid_action_blue[0], 0.0, 0.5], dtype=np.float32)
+        if i % 6 == 0: logger.log_state(env.fdm_red.get_sim_time(), env.fdm_red, env.fdm_blue)
+        if i % 60 == 0:
+            print(f"Step: {i} | Dist: {info['dist']:.1f}m | Timer: {env.gun_fire_timer} | Status: {info['reason']}")
 
-        # 运行环境
-        obs, reward, terminated, truncated, info = env.step(action_red, action_blue)
-
-        # --- 录制数据 (每 6 步录一次，即 10Hz) ---
-        if i % 6 == 0:
-            logger.log_state(env.fdm_red.get_sim_time(), env.fdm_red, env.fdm_blue)
-
-        if terminated:
-            print(f"仿真终止: {info['reason']}")
+        if terminated or truncated:
+            print(f"Simulation Ended: {info['reason']}")
             break
 
     logger.close()
     env.close()
-    print("录制完成：air_combat_dogfight.acmi")
 
 
 if __name__ == "__main__":
