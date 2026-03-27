@@ -3,22 +3,9 @@ import numpy as np
 import math
 import os
 import gymnasium as gym
+import gc
 from gymnasium import spaces
-
-class UnitreeStyleReward:
-    """宇树风格平滑奖励"""
-
-    def __init__(self, action_dim, sigma=0.1, weight=0.2):
-        self.prev_actions = np.zeros(action_dim)
-        self.sigma = sigma
-        self.weight = weight
-
-    def compute_action_smooth_reward(self, current_actions):
-        action_error = np.sum(np.square(current_actions - self.prev_actions))
-        smooth_reward = self.weight * np.exp(-action_error / self.sigma)
-        self.prev_actions = current_actions.copy()
-        return smooth_reward
-
+from baseline_action import FlightActions
 
 class AirCombatEnv(gym.Env):
     def __init__(self, model_name="f16", dt=1 / 60.0):
@@ -29,15 +16,17 @@ class AirCombatEnv(gym.Env):
 
         # 动作空间：[滚转, 俯仰, 偏航, 油门]
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
-        # 观测空间：19维
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(19,), dtype=np.float32)
 
-        self.smooth_handler = UnitreeStyleReward(action_dim=4)
-        self.steps = 0
+        # 观测空间升级为 23 维：
+        # 1-15: 本机状态 (高度, 速度, 姿态, 攻角, 过载, 舵面)
+        # 16-23: 增强相对态势 (高度差, 速度差, 距离, 相对方向矢量XYZ, ATA正余弦)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(23,), dtype=np.float32)
+
         self.fdm_red = None
         self.fdm_blue = None
-        self.missiles = []
-        self._create_records = False
+        self.prev_action = np.zeros(4)
+        self.prev_prev_action = np.zeros(4)
+        self.steps = 0
 
     def _create_fdm(self):
         fdm = jsbsim.FGFDMExec(self.root_path)
@@ -56,305 +45,281 @@ class AirCombatEnv(gym.Env):
         fdm.run_ic()
 
     def reset(self, seed=None, options=None):
-        super().reset(seed=seed)  # 适配 gymnasium 标准
+        super().reset(seed=seed)
         self.close()
+
         self.fdm_red = self._create_fdm()
         self.fdm_blue = self._create_fdm()
 
-        # 初始化位置 (恢复对冲布局或你需要的测试布局)
-        self._init_aircraft(self.fdm_red, 0.0, 0.0, 6000.0, 0.0, 250.0)
-        self._init_aircraft(self.fdm_blue, 0.15, 0.0, 6000.0, 180.0, 250.0)
+        # 初始化：红方朝北，蓝方在北边 0.15 度处朝南对冲
+        self._init_aircraft(self.fdm_red, 0.0, 0.0, 20000.0, 0.0, 300.0)
+        self._init_aircraft(self.fdm_blue, 0.15, 0.0, 20000.0, 180.0, 300.0)
 
-        # 关键：状态对齐
-        trim_props = [
-            'fcs/elevator-pos-norm', 'fcs/left-aileron-pos-norm',
-            'fcs/right-aileron-pos-norm', 'fcs/rudder-pos-norm',
-            'propulsion/engine/thrust-lbs', 'propulsion/engine/n2',
-            'aero/alpha-rad', 'aero/beta-rad'
-        ]
-        for prop in trim_props:
-            self.fdm_blue[prop] = self.fdm_red[prop]
-
+        self.prev_action = np.zeros(4)
+        self.prev_prev_action = np.zeros(4)
         self.steps = 0
-        self.missiles = []
-        self._create_records = False
-        return self._get_full_obs(), {}  # 返回 obs 和 empty info
 
-    def fire_missile(self, side="RED"):
-        """发射导弹逻辑"""
-        if side == "RED":
-            m = SimpleMissile(self.fdm_red, self.fdm_blue, id=f"RM{len(self.missiles)}")
-        else:
-            m = SimpleMissile(self.fdm_blue, self.fdm_red, id=f"BM{len(self.missiles)}")
-        self.missiles.append(m)
+        return self._get_full_obs(), {}
 
-    def step(self, action_red, action_blue, fire_red=False, fire_blue=False):
-        """执行物理步进，增加了 fire 参数"""
-        # 1. 应用控制指令
+    def step(self, action_red, action_blue):
         self._apply_action(self.fdm_red, action_red)
         self._apply_action(self.fdm_blue, action_blue)
 
-        # 2. 物理模拟
         self.fdm_red.run()
         self.fdm_blue.run()
-
-        # 3. 处理导弹发射 (修复了之前 NameError 的地方)
-        if fire_red:
-            self.fire_missile("RED")
-        if fire_blue:
-            self.fire_missile("BLUE")
-
-        # 4. 更新所有导弹状态
-        done_by_missile = False
-        missile_reason = "none"
-        for m in self.missiles:
-            if m.active:
-                status = m.update(self.dt)
-                if status == "HIT":
-                    done_by_missile = True
-                    missile_reason = f"MISSILE_HIT_{m.id}"
-
         self.steps += 1
 
-        # 5. 计算观测和奖励
         obs = self._get_full_obs()
         reward = self._compute_reward(self.fdm_red, self.fdm_blue, action_red)
 
-        # 6. 终止判定
         terminated = False
-        truncated = False
-        info = {"reason": "none"}
+        info = {"reason": "alive"}
 
-        alpha_deg = abs(obs[6] * 30.0)
-        if alpha_deg > 25.0:
-            terminated = True
-            info["reason"] = "STALL"
-        elif obs[0] * 10000.0 < 500.0:
+        # 终止条件：坠毁或严重失速
+        if (self.fdm_red['position/h-sl-ft'] * 0.3048) < 500.0:
             terminated = True
             info["reason"] = "CRASH"
-        elif done_by_missile:
+        if abs(self.fdm_red['aero/alpha-deg']) > 25.0:
             terminated = True
-            info["reason"] = missile_reason
-        elif self.steps > 100000:
-            truncated = True
-            info["reason"] = "TIMEOUT"
+            info["reason"] = "STALL"
 
-        return obs, reward, terminated, truncated, info
-
-    def _apply_action(self, fdm, action):
-        fdm['fcs/aileron-cmd-norm'] = action[0]
-        fdm['fcs/elevator-cmd-norm'] = action[1]
-        fdm['fcs/rudder-cmd-norm'] = action[2]
-        fdm['fcs/throttle-cmd-norm'] = action[3]
-
-    def _get_my_obs(self, fdm):
-        """本机状态: 15维"""
-        ft2m, fps2ms = 0.3048, 0.3048
-        alt = fdm['position/h-sl-ft'] * ft2m
-        v_true = fdm['velocities/vt-fps'] * fps2ms
-        roll, pitch, yaw = fdm['attitude/phi-rad'], fdm['attitude/theta-rad'], fdm['attitude/psi-rad']
-        alpha, beta = fdm['aero/alpha-rad'], fdm['aero/beta-rad']
-        nx = fdm['accelerations/n-pilot-x-norm']
-        ny = fdm['accelerations/n-pilot-y-norm']
-        nz = fdm['accelerations/n-pilot-z-norm']
-
-        return np.array([
-            alt / 10000.0, v_true / 340.0,
-            roll / math.pi, pitch / (math.pi / 2), math.sin(yaw), math.cos(yaw),
-            alpha / (math.pi / 6), beta / (math.pi / 18),
-            nx / 2.0, ny / 5.0, nz / 9.0,
-            fdm['fcs/left-aileron-pos-norm'], fdm['fcs/elevator-pos-norm'],
-            fdm['fcs/rudder-pos-norm'], fdm['fcs/throttle-pos-norm']
-        ], dtype=np.float32)
-
-    def _get_rel_obs(self, fdm_self, fdm_target):
-        """相对状态: 4维 (高度差, 速度差, 距离, 航向差)"""
-        # 简化版 NEU 坐标转换逻辑
-        pos_self = self._get_pos_neu(fdm_self)
-        pos_target = self._get_pos_neu(fdm_target)
-        rel_pos = pos_target - pos_self
-        dist = np.linalg.norm(rel_pos)
-
-        delta_alt = (fdm_target['position/h-sl-ft'] - fdm_self['position/h-sl-ft']) * 0.3048
-        delta_v = (fdm_target['velocities/vt-fps'] - fdm_self['velocities/vt-fps']) * 0.3048
-
-        # 航向差 (带 Side Flag)
-        vel_self = self._get_vel_neu(fdm_self)[:2]  # XY面速度
-        rel_pos_2d = rel_pos[:2]
-        angle_off = math.acos(
-            np.clip(np.dot(vel_self, rel_pos_2d) / (np.linalg.norm(vel_self) * np.linalg.norm(rel_pos_2d) + 1e-8), -1,
-                    1))
-        side_flag = np.sign(np.cross(vel_self, rel_pos_2d))
-        delta_heading = angle_off * (side_flag if side_flag != 0 else 1)
-
-        return np.array([delta_alt / 1000.0, delta_v / 340.0, dist / 100000.0, delta_heading / math.pi],
-                        dtype=np.float32)
-
-    def _get_full_obs(self):
-        """组合 15维本机 + 4维相对状态"""
-        # ... (这里保留之前写好的 _get_my_obs 和 _get_rel_obs 逻辑，代码略)
-        # 注意：过载项要使用你文档里提到的 n-pilot-z-norm
-        my_obs = self._get_my_obs(self.fdm_red)
-        rel_obs = self._get_rel_obs(self.fdm_red, self.fdm_blue)
-        return np.concatenate([my_obs, rel_obs])
-
-    def render(self, mode="txt", filepath='./BVR_Record.acmi'):
-        """手动拼接 ACMI 字符串，确保导弹使用纯数字 ID"""
-        if mode == "txt":
-            if not self._create_records:
-                with open(filepath, mode='w', encoding='utf-8-sig') as f:
-                    f.write("FileType=text/acmi/tacview\nFileVersion=2.1\n0,ReferenceTime=2024-01-01T00:00:00Z\n")
-                self._create_records = True
-
-            with open(filepath, mode='a', encoding='utf-8-sig') as f:
-                f.write(f"#{self.steps * self.dt:.2f}\n")
-
-                # 1. 写入两机坐标姿态 (101, 102)
-                f.write(self._tacview_line("101", self.fdm_red, "RED") + "\n")
-                f.write(self._tacview_line("102", self.fdm_blue, "BLUE") + "\n")
-
-                # 2. 导弹显示：使用 enumerate 生成纯数字序列
-                for idx, m in enumerate(self.missiles):
-                    if m.active:
-                        # 分配一个唯一的纯数字 ID，从 201 开始
-                        # 201, 202, 203... 这样绝不会和 101, 102 冲突
-                        numeric_id = 201 + idx
-
-                        # 格式说明：ID(纯数字), T=经度|纬度|高度, Name, Color, Type
-                        # 注意：只用一个逗号连接坐标块和属性块
-                        mlf = f"{numeric_id},T={m.pos[1]:.6f}|{m.pos[0]:.6f}|{m.pos[2]:.2f},"
-
-                        # 这里的 Name 可以随意写，但 ID 必须是数字
-                        # 增加 Color 区分，如果是红方导弹(假设前几个是红方的)可以用逻辑判断
-                        color = "Red" if "RM" in str(m.id) else "Blue"
-                        mlf += f"Name=AIM-120C,Color={color},Type=Weapon+Missile"
-
-                        f.write(mlf + "\n")
-
-    def _tacview_line(self, id, fdm, name):
-        # 提取数据
-        lon = fdm['position/long-gc-deg']
-        lat = fdm['position/lat-gc-deg']
-        alt = fdm['position/h-sl-ft'] * 0.3048
-        phi = fdm['attitude/phi-deg']
-        theta = fdm['attitude/theta-deg']
-        psi = fdm['attitude/psi-deg']
-
-        # 拼接字符串
-        # 注意：Type=Air+FixedWing 告诉 Tacview 这是一个飞机
-        # 如果你想区分红蓝，Color 在这里也很有用
-        color = "Red" if name == "RED" else "Blue"
-
-        line = f"{id},T={lon:.6f}|{lat:.6f}|{alt:.2f}|{phi:.2f}|{theta:.2f}|{psi:.2f},"
-        line += f"Name={name},Color={color},Type=Air+FixedWing+Fighter"
-        return line
-
-    # --- 辅助工具函数 ---
-    def _apply_action(self, fdm, action):
-        fdm['fcs/aileron-cmd-norm'] = action[0]
-        fdm['fcs/elevator-cmd-norm'] = action[1]
-        fdm['fcs/rudder-cmd-norm'] = action[2]
-        fdm['fcs/throttle-cmd-norm'] = action[3]
-
-    def _get_pos_neu(self, fdm):
-        # 简化的经纬度转平直坐标 (仅作相对计算)
-        return np.array([fdm['position/lat-gc-deg'] * 111000, fdm['position/long-gc-deg'] * 111000,
-                         fdm['position/h-sl-ft'] * 0.3048])
-
-    def _get_vel_neu(self, fdm):
-        return np.array(
-            [fdm['velocities/v-north-fps'], fdm['velocities/v-east-fps'], -fdm['velocities/v-down-fps']]) * 0.3048
-
-    def _calculate_ata(self, fdm_s, fdm_t):
-        # 计算 Antenna Train Angle (机头指向与目标夹角)
-        v_body = np.array([1, 0, 0])  # 简化假设机体坐标系
-        return abs(
-            fdm_s['attitude/psi-rad'] - math.atan2(fdm_t['position/long-gc-deg'] - fdm_s['position/long-gc-deg'],
-                                                   fdm_t['position/lat-gc-deg'] - fdm_s['position/lat-gc-deg']))
+        return obs, reward, terminated, False, info
 
     def close(self):
-        self.fdm_red = None
-        self.fdm_blue = None
+        if self.fdm_red is not None:
+            del self.fdm_red
+            self.fdm_red = None
+        if self.fdm_blue is not None:
+            del self.fdm_blue
+            self.fdm_blue = None
+        gc.collect()
+
+    def _apply_action(self, fdm, action):
+        fdm['fcs/aileron-cmd-norm'] = action[0]
+        fdm['fcs/elevator-cmd-norm'] = action[1]
+        fdm['fcs/rudder-cmd-norm'] = action[2]
+        fdm['fcs/throttle-cmd-norm'] = (action[3] + 1.0) * 0.5
+
+    def _get_full_obs(self):
+        # 1. 本机状态 (15维)
+        def get_my_obs(fdm):
+            return np.array([
+                fdm['position/h-sl-ft'] * 0.3048 / 10000.0,
+                fdm['velocities/vt-fps'] * 0.3048 / 340.0,
+                fdm['attitude/phi-rad'] / math.pi,
+                fdm['attitude/theta-rad'] / (math.pi / 2),
+                math.sin(fdm['attitude/psi-rad']),
+                math.cos(fdm['attitude/psi-rad']),
+                fdm['aero/alpha-rad'] / (math.pi / 6),
+                fdm['aero/beta-rad'] / (math.pi / 18),
+                fdm['accelerations/n-pilot-x-norm'] / 2.0,
+                fdm['accelerations/n-pilot-y-norm'] / 5.0,
+                fdm['accelerations/n-pilot-z-norm'] / 9.0,
+                fdm['fcs/left-aileron-pos-norm'],
+                fdm['fcs/elevator-pos-norm'],
+                fdm['fcs/rudder-pos-norm'],
+                fdm['fcs/throttle-pos-norm']
+            ], dtype=np.float32)
+
+        # 2. 增强相对态势 (8维)
+        def get_rel_obs(f_s, f_t):
+            pos_s = self._get_pos_neu(f_s)
+            pos_t = self._get_pos_neu(f_t)
+            rel_pos = pos_t - pos_s
+            dist = np.linalg.norm(rel_pos)
+            rel_dir = rel_pos / (dist + 1e-6)  # 包含前后、左右、高低的方向矢量
+
+            d_alt = (f_t['position/h-sl-ft'] - f_s['position/h-sl-ft']) * 0.3048
+            d_v = (f_t['velocities/vt-fps'] - f_s['velocities/vt-fps']) * 0.3048
+
+            ata = self._calculate_ata(f_s, f_t)
+
+            return np.array([
+                d_alt / 1000.0,  # 高低差
+                d_v / 340.0,  # 速度差
+                dist / 100000.0,  # 远近
+                rel_dir[0],  # 北向(前/后感)
+                rel_dir[1],  # 东向(左/右感)
+                rel_dir[2],  # 天向(高/低感)
+                math.sin(ata),  # 进攻指向感 sin
+                math.cos(ata)  # 进攻指向感 cos
+            ], dtype=np.float32)
+
+        return np.concatenate([get_my_obs(self.fdm_red), get_rel_obs(self.fdm_red, self.fdm_blue)])
+
+    def _get_pos_neu(self, fdm):
+        return np.array([
+            fdm['position/lat-gc-deg'] * 111000,
+            fdm['position/long-gc-deg'] * 111000,
+            fdm['position/h-sl-ft'] * 0.3048
+        ])
+
+    def _get_vel_neu(self, fdm):
+        return np.array([
+            fdm['velocities/v-north-fps'],
+            fdm['velocities/v-east-fps'],
+            -fdm['velocities/v-down-fps']
+        ]) * 0.3048
+
+    def _calculate_ata(self, fdm_s, fdm_t):
+        """计算天线指向角 (Antenna Train Angle)"""
+        pos_s, pos_t = self._get_pos_neu(fdm_s), self._get_pos_neu(fdm_t)
+        rel_pos_vec = (pos_t - pos_s) / (np.linalg.norm(pos_t - pos_s) + 1e-6)
+
+        # 机头指向矢量 (Body X-axis in NEU)
+        psi, theta = fdm_s['attitude/psi-rad'], fdm_s['attitude/theta-rad']
+        head_dir = np.array([
+            math.cos(theta) * math.cos(psi),
+            math.cos(theta) * math.sin(psi),
+            math.sin(theta)
+        ])
+        return math.acos(np.clip(np.dot(head_dir, rel_pos_vec), -1.0, 1.0))
+
+    # --- 奖励与惩罚系统 ---
 
     def _compute_reward(self, fdm_s, fdm_t, action_s):
-        obs = self._get_my_obs(fdm_s)
-        rel_obs = self._get_rel_obs(fdm_s, fdm_t)
-        dist = rel_obs[2] * 100000.0
-        delta_heading = rel_obs[3] * math.pi
+        return self._compute_situation_reward(fdm_s, fdm_t) + \
+            self._compute_alpha_penalty(fdm_s) + \
+            self._compute_smoothness_penalty(action_s)
 
-        # 1. 宇树风格：动作平滑奖励
-        r_smooth = self.smooth_handler.compute_action_smooth_reward(action_s)
+    def _compute_situation_reward(self, fdm_s, fdm_t):
+        pos_s, pos_t = self._get_pos_neu(fdm_s), self._get_pos_neu(fdm_t)
+        vel_s, vel_t = self._get_vel_neu(fdm_s), self._get_vel_neu(fdm_t)
+        v_s, v_t = np.linalg.norm(vel_s), np.linalg.norm(vel_t)
 
-        # 2. 宇树风格：失速惩罚 (Alpha Constraint)
-        # 从 obs[6] 还原 alpha 度数: obs[6] * 30
-        alpha_deg = abs(obs[6] * 30.0)
-        p_stall = 0.0
-        if alpha_deg > 18.0:
-            p_stall = 0.5 * (alpha_deg - 18.0) ** 2
-        if alpha_deg > 25.0:
-            p_stall = 500.0  # 触发硬终止的惩罚量
+        r_dist = np.exp(-((np.linalg.norm(pos_t - pos_s) - 40000) ** 2) / (2 * 20000 ** 2))
+        r_alt = np.tanh((pos_s[2] - pos_t[2]) / 2000.0)
+        r_vel = 0.5 * np.tanh((v_s - v_t) / 50.0) + 0.5 * np.exp(-((v_s - 320) ** 2) / 20000)
 
-        # 3. BVR 战术奖励 (Crank Logic)
-        ata = self._calculate_ata(fdm_s, fdm_t)
-        r_bvr = 0.0
-        if dist > 60000:
-            r_bvr = 1.0 * np.exp(-abs(delta_heading))  # 远距离追踪
-        else:
-            # 近距离 Crank 奖励: 鼓励保持在 45度(0.78rad) 左右
-            error_crank = abs(delta_heading) - 0.78
-            r_bvr = 1.5 * np.exp(-(error_crank ** 2) / 0.1)
+        energy_s = pos_s[2] + (v_s ** 2) / (2 * 9.81)
+        energy_t = pos_t[2] + (v_t ** 2) / (2 * 9.81)
+        r_energy = np.tanh((energy_s - energy_t) / 5000.0)
 
-        return r_smooth + r_bvr - p_stall
+        return r_dist + r_alt + r_vel + r_energy
+
+    def _compute_alpha_penalty(self, fdm_s):
+        alpha = abs(fdm_s['aero/alpha-deg'])
+        penalty = 0.0
+        if alpha > 18.0:
+            penalty = 0.5 * (alpha - 18.0) ** 2
+            if alpha > 25.0: penalty += 100.0
+        return -penalty
+
+    def _compute_smoothness_penalty(self, current_action):
+        rate_error = np.sum(np.square(current_action - self.prev_action))
+        accel_error = np.sum(np.square(current_action - 2 * self.prev_action + self.prev_prev_action))
+
+        self.prev_prev_action = self.prev_action.copy()
+        self.prev_action = current_action.copy()
+
+        return -(0.1 * rate_error + 0.05 * accel_error)
 
 
-class SimpleMissile:
-    def __init__(self, launcher_fdm, target_fdm, id="M1"):
-        self.active = True
-        self.id = id
-        self.target_fdm = target_fdm
+import jsbsim
+import numpy as np
+import math
+import os
 
-        # 初始位置：从发射机位置启动
-        self.pos = np.array([
-            launcher_fdm['position/lat-gc-deg'],
-            launcher_fdm['position/long-gc-deg'],
-            launcher_fdm['position/h-sl-ft'] * 0.3048
-        ])
 
-        # 初始速度：发射机速度 + 导弹初速 (假设 300m/s)
-        self.speed = launcher_fdm['velocities/vt-fps'] * 0.3048 + 300.0
-        self.heading = launcher_fdm['attitude/psi-rad']
-        self.pitch = launcher_fdm['attitude/theta-rad']
+# --- 增强版 ACMI 录制类：支持双机 ---
+class ACMIDualLogger:
+    def __init__(self, filename="air_combat_test.acmi"):
+        self.file = open(filename, "w", encoding="utf-8")
+        self.file.write("FileType=text/acmi/tacview\n")
+        self.file.write("FileVersion=2.1\n")
+        self.file.write("0,ReferenceTime=2024-01-01T00:00:00Z\n")
 
-        self.timer = 0
-        self.max_time = 40.0  # 动力射程时间
+    def log_state(self, sim_time, fdm_red, fdm_blue):
+        self.file.write(f"#{sim_time:.2f}\n")
 
-    def update(self, dt):
-        if not self.active: return
+        # 记录红方 (ID=1)
+        self._write_aircraft(1, fdm_red, "F-16_RED", "Red")
+        # 记录蓝方 (ID=2)
+        self._write_aircraft(2, fdm_blue, "F-16_BLUE", "Blue")
 
-        # 1. 获取目标位置
-        target_pos = np.array([
-            self.target_fdm['position/lat-gc-deg'],
-            self.target_fdm['position/long-gc-deg'],
-            self.target_fdm['position/h-sl-ft'] * 0.3048
-        ])
+    def _write_aircraft(self, obj_id, fdm, name, color):
+        lat = fdm['position/lat-geod-deg']
+        lon = fdm['position/long-gc-deg']
+        alt = fdm['position/h-sl-ft'] * 0.3048
+        roll = fdm['attitude/phi-deg']
+        pitch = fdm['attitude/theta-deg']
+        yaw = fdm['attitude/heading-true-rad']
+        yaw = np.rad2deg(yaw)
+        # T=Lon|Lat|Alt|Roll|Pitch|Yaw
+        line = f"{obj_id},T={lon}|{lat}|{alt}|{roll}|{pitch}|{yaw},Name={name},Color={color},Type=Air+FixedWing\n"
+        self.file.write(line)
 
-        # 2. 简单的比例导引逻辑 (朝向目标点移动)
-        # 这里用简化的经纬度差转向量
-        dir_vec = target_pos - self.pos
-        # 纬度1度约111km，经度1度在30度纬度约96km
-        dist_vec = dir_vec * np.array([111000, 96000, 1])
-        dist = np.linalg.norm(dist_vec)
+    def close(self):
+        self.file.close()
 
-        if dist < 500:  # 命中判定
-            self.active = False
-            return "HIT"
 
-        # 更新位置 (简化：匀速直线追逐)
-        move_dir = dist_vec / (dist + 1e-6)
-        self.pos += (move_dir * self.speed * dt) / np.array([111000, 96000, 1])
+# --- 修改后的 test_env 函数 ---
+def test_env():
+    # 1. 初始化环境与录制器
+    env = AirCombatEnv(model_name="f16")
+    obs, _ = env.reset()
 
-        self.timer += dt
-        if self.timer > self.max_time:
-            self.active = False
-            return "MISS"
-        return "FLYING"
+    # 初始化控制器和录制器
+    controller = FlightActions()
+    controller_blue = FlightActions()
+    logger = ACMIDualLogger("air_combat_dogfight.acmi")
+
+    print(f"{'Step':<6} | {'Dist(km)':<10} | {'ATA(deg)':<8} | {'Status':<10}")
+    print("-" * 50)
+
+    # 模拟运行 1200 步 (约 20 秒，dt=1/60)
+    for i in range(12000):
+        # --- 红方逻辑：使用 PID 保持攻角和滚转 ---
+        curr_alpha = env.fdm_red['aero/alpha-deg']
+
+        curr_roll = env.fdm_red['attitude/phi-deg']
+        curr_q = env.fdm_red['velocities/q-rad_sec']
+        curr_p = env.fdm_red['velocities/p-rad_sec']
+
+        curr_alpha_blue = env.fdm_blue['aero/alpha-deg']
+        curr_roll_blue = env.fdm_blue['attitude/phi-deg']
+        curr_q_blue = env.fdm_blue['velocities/q-rad_sec']
+        curr_p_blue = env.fdm_blue['velocities/p-rad_sec']
+        # 获取红方 Action (维持 2.5度攻角平飞)
+        pid_action = controller.get_action(
+            current_alpha=curr_alpha,
+            current_roll=curr_roll,
+            q_rad=curr_q,
+            p_rad=curr_p,
+            target_alpha=0.1,
+            target_roll=0.0
+        )
+
+        pid_action_blue = controller_blue.get_action(
+            current_alpha=curr_alpha_blue,
+            current_roll=curr_roll_blue,
+            q_rad=curr_q_blue,
+            p_rad=curr_p_blue,
+            target_alpha=0.0,
+            target_roll=0.0
+        )
+        # 组装 Action [aileron, elevator, rudder, throttle]
+        # 注意：env.step 期望的是红蓝双方的动作
+        action_red = np.array([pid_action[1], -pid_action[0], 0.0, 0.8], dtype=np.float32)
+
+        # 蓝方逻辑：保持现状，油门 0.5
+        action_blue = np.array([pid_action_blue[1], -pid_action_blue[0], 0.0, 0.5], dtype=np.float32)
+
+        # 运行环境
+        obs, reward, terminated, truncated, info = env.step(action_red, action_blue)
+
+        # --- 录制数据 (每 6 步录一次，即 10Hz) ---
+        if i % 6 == 0:
+            logger.log_state(env.fdm_red.get_sim_time(), env.fdm_red, env.fdm_blue)
+
+        if terminated:
+            print(f"仿真终止: {info['reason']}")
+            break
+
+    logger.close()
+    env.close()
+    print("录制完成：air_combat_dogfight.acmi")
+
+
+if __name__ == "__main__":
+    test_env()
